@@ -1,20 +1,5 @@
 module t
 
-#=
-Features:
-All alphabets
-Variable-length encoding
-Iterators support other biosequences
-Fast
-
-- kmer_or(kmer, i, symbol): OR symbol to i pos in kmer
-    - use this for first K in simplekmeriterator and after amb nuc
-simplekmeriterator{<:Kmer{K, A, T}} wraps a LongSequence{A}, very simple,
-only returns the kmers no skipping postiios!
-
-
-=#
-
 using BitIntegers
 using BioSequences
 
@@ -23,7 +8,7 @@ import Random
 import BioSequences: encoded_data, extract_encoded_element, complement_bitpar,
 reversebits, BitsPerSymbol, reverse, complement, reverse_complement,
 MerIterResult, encoded_data_eltype, repeatpattern, canonical, inbounds_getindex,
-encoded_data_type, bits_per_symbol, bitmask, decode, encode, bitindex
+encoded_data_type, bits_per_symbol, bitmask, decode, encode, bitindex, BitIndex
 
 struct Kmer{K, A <: Alphabet, T <: Unsigned} <: BioSequence{A}
     data::T
@@ -39,32 +24,35 @@ end
 const RNAKmer{K} = Kmer{K, RNAAlphabet{2}, UInt64}
 const DNAKmer{K} = Kmer{K, DNAAlphabet{2}, UInt64}
 
+function Base.convert(::Type{<:Kmer{K, A, T1}}, m::Kmer{K, A, T2}) where {K, A, T1, T2}
+    return Kmer{K, A, T1}(m.data % T1)
+end
+
+# TODO: Add convertsion methods from NucleicAcidAlphabet to each other
+
 encoded_data(m::Kmer) = m.data
 Base.length(m::Kmer{K}) where K = K
-shiftmask(::Type{<:Kmer{K, A, T}}) where {K, A, T} = (8 * sizeof(T)) - 1
 mask(::Type{<:Kmer{K, A, T}}) where {K, A, T} = one(T) << (bits_per_symbol(A()) * K) - 1
 capacity(::Type{<:Kmer{K, A, T}}) where {K, A, T} = div(8, bits_per_symbol(A())) * sizeof(T)
 ksize(::Type{<:Kmer{K}}) where K = K
-n_unused(::Type{T}) where {T <: Kmer} = capacity(T) - ksize(T)
 Base.summary(x::Kmer{K, A}) where {K, A} = string(K, "-mer of ", A)
 encoded_data_type(::Type{<:Kmer{K, A, T}}) where {K, A, T} = T
 Base.zero(::Type{T}) where {T <: Kmer} = T(zero(encoded_data_type(T)))
 
-@inline function bitshift(::Type{<:Kmer{K, A, T}}, i::Integer) where {K, A, T}
-    ((K-i) * bits_per_symbol(A())) & ((8 * sizeof(T)) - 1)
+# TODO: Add this to Twiddle?
+↞(data::Unsigned, shift::Integer) = data << (shift & (8*sizeof(data) - 1))
+↠(data::Unsigned, shift::Integer) = data >>> (shift & (8*sizeof(data) - 1))
+
+@inline function bitindex(m::Kmer, i::Integer)
+    B = bits_per_symbol(m)
+    T = encoded_data_type(m)
+    val = (B * (ksize(typeof(m))-i))
+    return BitIndex{B, encoded_data_type(m)}(val)
 end
 
-@inline function inbounds_getindex(m::Kmer{K, A}, i::Integer) where {K, A}
-    data = (m.data >>> bitshift(typeof(m), i)) & bitmask(bits_per_symbol(A()))
-    return decode(A(), data)
+function extract_encoded_element(bitind::BitIndex, data::Unsigned)
+    return (data ↠ bitind.val) & bitmask(bits_per_symbol(bitind))
 end
-
-@inline function Base.getindex(m::Kmer{K, A}, i::Integer) where {K, A}
-    @boundscheck checkbounds(m, i)
-    return inbounds_getindex(m, i)
-end
-
-Base.iterate(m::Kmer, i::Int=1) = i > length(m) ? nothing : (@inbounds m[i], i+1)
 
 # TODO: Fix the one in BioSequences instead or lift it here.
 @inline function reversebits(x::Unsigned, ::BitsPerSymbol{2})
@@ -86,9 +74,10 @@ reversebits(x::Unsigned, ::BitsPerSymbol{8}) = bswap(x)
 end
 
 @inline function reverse(m::Kmer{K, A}) where {K, A}
+    T = typeof(m)
     data = reversebits(m.data, BitsPerSymbol(m))
-    offset = (bits_per_symbol(A()) * n_unused(typeof(m))) & shiftmask(typeof(m))
-    return typeof(m)(data >>> offset)
+    offset = bits_per_symbol(A()) * (capacity(T) - ksize(T))
+    return typeof(m)(data ↠ offset)
 end
 
 reverse_complement(m::Kmer) = reverse(complement(m))
@@ -106,14 +95,14 @@ end
 end
 
 @inline function push(m::Kmer, encoded::Unsigned)
-    data = m.data << bits_per_symbol(m)
+    data = m.data ↞ bits_per_symbol(m)
     data |= encoded
     data &= mask(typeof(m))
     return typeof(m)(data)
 end
 
 @inline function pushfirst(m::Kmer, x)
-    shifted = typeof(m)(m.data >>> bits_per_symbol(m))
+    shifted = typeof(m)(m.data ↠ bits_per_symbol(m))
     return or_bits(shifted, x, 1)
 end
 
@@ -124,7 +113,7 @@ end
 end
 
 @inline function or_bits(m::Kmer, encoding::Unsigned, i::Integer)
-    add = (encoding % encoded_data_type(m)) << bitshift(typeof(m), i)
+    add = (encoding % encoded_data_type(m)) ↞ bitindex(m, i).val
     return typeof(m)(m.data | add)
 end
 
@@ -150,6 +139,7 @@ function Kmer{K, A, T}(s) where {K, A, T}
     return m
 end
 
+# TODO: Add this to Twiddle?
 # This code is weird, but it's the only way I can get it to constant fold
 # for UInt1024.
 function repeatpattern(::Type{T}, pattern::P) where {T <: Unsigned, P <: Unsigned}
@@ -196,7 +186,7 @@ end
 
 # This is more efficient since we can load data directly from one encoding to
 # the other with no re-encoding/decoding
-@inline function extract_data(s::LongSequence, i::Integer)
+@inline function extract_data(s::Union{Kmer, LongSequence}, i::Integer)
     extract_encoded_element(bitindex(s, i), encoded_data(s))
 end
 
@@ -219,7 +209,7 @@ end
 SimpleKmerIterator{K}(s::BioSequence) where K = SimpleKmerIterator{K, typeof(s)}(s)
 
 Base.length(s::SimpleKmerIterator{K}) where K = length(s.seq) - ksize(K) + 1
-Base.eltype(s::SimpleKmerIterator{K}) where K = K
+Base.eltype(s::Type{<:SimpleKmerIterator{K}}) where K = K
 
 function Base.iterate(it::SimpleKmerIterator{K}) where K
     length(it) < 1 && return nothing
@@ -263,12 +253,10 @@ struct StandardKmerIterator{K <: Kmer{<:Any, <:NucleicAcidAlphabet}, S <: BioSeq
 end
 
 StandardKmerIterator{K}(s::BioSequence) where K = StandardKmerIterator{K, typeof(s)}(s)
-
 Base.IteratorSize(::Type{<:StandardKmerIterator{<:Any, <:BioSequence{<:NucleicAcidAlphabet{4}}}}) = Base.SizeUnknown()
 Base.length(::StandardKmerIterator{K, BioSequence{<:NucleicAcidAlphabet{2}}}) where K = length(s.seq) - ksize(K) + 1
 Base.eltype(s::Type{<:StandardKmerIterator{K}}) where K = MerIter{K}
 
-# This is wrong for 4-bit nucs
 complement_encoded(A::NucleicAcidAlphabet{2}, bits::Unsigned) = bits ⊻ typeof(bits)(3)
 complement_encoded(A::NucleicAcidAlphabet{4}, bits::Unsigned) = @inbounds FOURBIT_C_LUT[bits + 1]
 
