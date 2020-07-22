@@ -192,11 +192,11 @@ end
 ###########################
 
 # Generic fallback for biosequence type
-extract_data(s::BioSequence, i::Integer) = @inbounds s[i]
+@inline extract_data(s::BioSequence, i::Integer) = @inbounds s[i]
 
 # This is more efficient since we can load data directly from one encoding to
 # the other with no re-encoding/decoding
-function extract_data(s::LongSequence, i::Integer)
+@inline function extract_data(s::LongSequence, i::Integer)
     extract_encoded_element(bitindex(s, i), encoded_data(s))
 end
 
@@ -216,6 +216,8 @@ struct SimpleKmerIterator{K <: Kmer, S <: BioSequence}
     end
 end
 
+SimpleKmerIterator{K}(s::BioSequence) where K = SimpleKmerIterator{K, typeof(s)}(s)
+
 Base.length(s::SimpleKmerIterator{K}) where K = length(s.seq) - ksize(K) + 1
 Base.eltype(s::SimpleKmerIterator{K}) where K = K
 
@@ -233,8 +235,8 @@ function Base.iterate(it::SimpleKmerIterator{K}, state) where K
     m, i = state
     i > length(it.seq) && return nothing
     data = extract_data(it.seq, i)
-    m2 = push(m, data)
-    return m2, (m2, i + 1)
+    m = push(m, data)
+    return m, (m, i + 1)
 end
 
 ############################
@@ -244,6 +246,8 @@ struct MerIter{M <: Kmer}
     fw::M
     rv::M
 end
+
+canonical(m::MerIter) = ifelse(m.fw < m.rv, m.fw, m.rv)
 
 struct StandardKmerIterator{K <: Kmer{<:Any, <:NucleicAcidAlphabet}, S <: BioSequence{<:NucleicAcidAlphabet}}
     seq::S
@@ -258,40 +262,81 @@ struct StandardKmerIterator{K <: Kmer{<:Any, <:NucleicAcidAlphabet}, S <: BioSeq
     end
 end
 
-Base.IteratorSize(::Type{<:StandardKmerIterator{<:Any, BioSequence{<:NucleicAcidAlphabet{4}}}}) = Base.SizeUnknown()
-Base.length(::StandardKmerIterator{K, BioSequence{<:NucleicAcidAlphabet{2}}}) where K = length(s.seq) - ksize(K) + 1
-Base.eltype(s::SimpleKmerIterator{K}) where K = MerIter{K}
+StandardKmerIterator{K}(s::BioSequence) where K = StandardKmerIterator{K, typeof(s)}(s)
 
-complement_encoded(A::Alphabet, bits::Unsigned) =bits ⊻ bitmask(bits_per_symbol(A))
+Base.IteratorSize(::Type{<:StandardKmerIterator{<:Any, <:BioSequence{<:NucleicAcidAlphabet{4}}}}) = Base.SizeUnknown()
+Base.length(::StandardKmerIterator{K, BioSequence{<:NucleicAcidAlphabet{2}}}) where K = length(s.seq) - ksize(K) + 1
+Base.eltype(s::Type{<:StandardKmerIterator{K}}) where K = MerIter{K}
+
+# This is wrong for 4-bit nucs
+complement_encoded(A::NucleicAcidAlphabet{2}, bits::Unsigned) = bits ⊻ typeof(bits)(3)
+complement_encoded(A::NucleicAcidAlphabet{4}, bits::Unsigned) = @inbounds FOURBIT_C_LUT[bits + 1]
 
 const TWOBIT_LUT = (0xf, 0x0, 0x1, 0x0,
                     0x2, 0xf, 0xf, 0xf,
-                    0x4, 0xf, 0xf, 0xf,
+                    0x3, 0xf, 0xf, 0xf,
                     0xf, 0xf, 0xf, 0xf)
 
-convert_twobit(::NucleicAcidAlphabet{2}, x::Unsigned) = x
-convert_twobit(::NucleicAcidAlphabet{4}, x::Unsigned) = x
+const FOURBIT_LUT = (0x1, 0x2, 0x4, 0x8)
 
-function Base.iterate(it::StandardKmerIterator{K}) where K
-    filled = 0
+const FOURBIT_C_LUT = (0x00, 0x08, 0x04, 0x0c,
+                       0x02, 0x0a, 0x06, 0x0e,
+                       0x01, 0x09, 0x05, 0x0d,
+                       0x03, 0x0b, 0x07, 0x0f)
+
+# Fallback
+convert_encoding(to::NucleicAcidAlphabet{N}, from::NucleicAcidAlphabet{N}, x) where N = x
+convert_encoding(to::NucleicAcidAlphabet{2}, from::NucleicAcidAlphabet{4}, x) = @inbounds TWOBIT_LUT[x + 1]
+convert_encoding(to::NucleicAcidAlphabet{4}, from::NucleicAcidAlphabet{2}, x) = @inbounds FOURBIT_LUT[x + 1]
+
+function fill_k!(::Type{K}, seq, p) where {K <: Kmer}
     fw = zero(K)
     rv = zero(K)
-    i = 0
+    good = true
+    for i in 1:ksize(K)
+        data = extract_data(seq, p+i-1)
+        encoding = convert_encoding(Alphabet(K), Alphabet(seq), data)
+        complemented = complement_encoded(Alphabet(K), encoding)
+        fw = or_bits(fw, encoding, i)
+        rv = or_bits(rv, complemented, ksize(K)-i+1)
+        good &= encoding < 0xf
+    end
+    return fw, rv, good
+end
+
+@inline function Base.iterate(it::StandardKmerIterator{K}) where K
+    good = false
     len = length(it.seq)
-    while filled != ksize(K)
-        filled += 1
-        i += 1
-        i > len && return nothing
-        data = extract_data(it.seq, i)
-        complemented = complement_encoded(Alphabet(K), data)
-        fw = push(fw, data)
-        println(fw)
-        rv = pushfirst(rv, complemented)
+    i = 1
+    fw = rv = zero(K)
+    while !good
+        i + ksize(K) > len && return nothing
+        fw, rv, good = fill_k!(K, it.seq, i)
+        i += ksize(K)
     end
     res = MerIter(i, fw, rv)
     return res, res
 end
 
-
+@inline function Base.iterate(it::StandardKmerIterator{K}, state) where K
+    i = state.pos + 1
+    fw = state.fw
+    rv = state.rv
+    len = length(it.seq)
+    i > len && return nothing
+    data = extract_data(it.seq, i)
+    encoding = convert_encoding(Alphabet(K), Alphabet(it.seq), data)
+    complemented = complement_encoded(Alphabet(K), encoding)
+    fw = push(fw, encoding)
+    rv = pushfirst(rv, complemented)
+    good = encoding < 0xf
+    while !good
+        i + ksize(K) > len && return nothing
+        fw, rv, good = fill_k!(K, it.seq, i)
+        i += ksize(K)
+    end
+    res = MerIter(i, fw, rv)
+    return res, res
+end
 
 end # t
