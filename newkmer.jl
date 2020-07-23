@@ -9,7 +9,7 @@ import BioSequences: encoded_data, extract_encoded_element, complement_bitpar,
 reversebits, BitsPerSymbol, reverse, complement, reverse_complement,
 MerIterResult, encoded_data_eltype, repeatpattern, canonical, inbounds_getindex,
 encoded_data_type, bits_per_symbol, bitmask, decode, encode, bitindex, BitIndex,
-offset, DefaultAASampler
+offset, DefaultAASampler, remove_newlines
 
 struct Kmer{K, A <: Alphabet, T <: Unsigned} <: BioSequence{A}
     data::T
@@ -21,7 +21,12 @@ struct Kmer{K, A <: Alphabet, T <: Unsigned} <: BioSequence{A}
 end
 
 # TODO: Update BioSequences/src/bit-manipulation/bitindex offset_mask(i::BitIndex)
-# to not return a UInt8 but a W type
+# to not return a UInt8 but a W type. Update this in bioseq, delete it here.
+# If you don't do this, it will overflow at W = UInt256 since 256 can't be
+# converted to UInt8
+function offset(i::BitIndex{B,W}) where {B,W}
+    i.val & (W(8 * sizeof(W)) - 0x01)
+end
 
 # Normally error functions should have noinline, but since this is resolved
 # at compile time, we really want to inline this to remove the check.
@@ -32,9 +37,8 @@ end
 # Should also be resolved at compile time
 @inline function kmertype(::Type{Kmer{K, A}}) where {K, A}
     bits = K * bits_per_symbol(A())
-    if bits < 33
-        return Kmer{K, A, UInt32}
-    elseif bits < 65
+    # Default to 64 bits, because they can fit in most registers.
+    if bits < 65
         return Kmer{K, A, UInt64}
     elseif bits < 129
         return Kmer{K, A, UInt128}
@@ -51,6 +55,7 @@ end
 
 const RNAKmer{K} = Kmer{K, RNAAlphabet{2}, UInt64}
 const DNAKmer{K} = Kmer{K, DNAAlphabet{2}, UInt64}
+const AAKmer{K} = Kmer{K, AminoAcidAlphabet, UInt64}
 
 function Base.convert(::Type{<:Kmer{K, A, T1}}, m::Kmer{K, A, T2}) where {K, A, T1, T2}
     return Kmer{K, A, T1}(m.data % T1)
@@ -82,6 +87,7 @@ Base.typemin(::Type{T}) where {T <: Kmer} = T(zero(encoded_data_type(T)))
     return BitIndex{B, encoded_data_type(m)}(val)
 end
 
+# TODO: Add this to BioSequences
 function extract_encoded_element(bitind::BitIndex, data::Unsigned)
     return (data ↠ offset(bitind)) & bitmask(bits_per_symbol(bitind))
 end
@@ -187,8 +193,12 @@ function Kmer{K, A, T}(s) where {K, A, T}
     return m
 end
 
-# This is awfully type unstable.
-function Kmer{A}(s) where {A}
+# function (::Type{Foo{A,B,C} where {A,C}})() where {B}
+#     ...
+# end
+
+# TODO: Make a proper constructor for this, I just can't figure out how
+function Kmer(::Type{A}, s) where {A <: Alphabet}
     K = length(s)
     kT = kmertype(Kmer{K, A})
     m = typemin(kT)
@@ -198,6 +208,23 @@ function Kmer{A}(s) where {A}
         m = or_bits(m, i, k)
     end
     return m
+end
+
+macro kmer_str(seq, flag)
+    if flag == "dna" || flag == "d"
+        A = DNAAlphabet{2}
+    elseif flag == "rna" || flag == "r"
+        A = RNAAlphabet{2}
+    elseif flag == "aa" || flag == "a"
+        A = AminoAcidAlphabet
+    else
+        error("Invalid type flag: '$(flag)'")
+    end
+    return Kmer(A, remove_newlines(seq))
+end
+
+macro kmer_str(seq)
+    return Kmer(DNAAlphabet{2}, remove_newlines(seq))
 end
 
 # TODO: Add this to Twiddle?
@@ -239,6 +266,8 @@ function Base.rand(::Type{T}) where {T <: Kmer{K, AminoAcidAlphabet} where K}
     return m
 end
 
+# Dispatch to bits per symbol, since I don't know how to generalize this
+# to symbols larger than 8 bits
 Random.shuffle(m::Kmer) = _shuffle(m, BitsPerSymbol(m))
 
 # It allocates, but in-register shuffles are very slow for larger kmers
@@ -284,11 +313,7 @@ struct SimpleKmerIterator{K <: Kmer, S <: BioSequence}
         if Alphabet(K) !== Alphabet(S)
             throw(ArgumentError("Parameters K and S must have same alphabets"))
         end
-        if capacity(K) < ksize(K)
-            T = encoded_data_type(K)
-            k = ksize(K)
-            throw(ArgumentError("Kmer of type $T cannot support a K of $k"))
-        end
+        check_kmer_len(K)
         new(s)
     end
 end
@@ -336,14 +361,16 @@ struct StandardKmerIterator{K <: Kmer{<:Any, <:NucleicAcidAlphabet}, S <: BioSeq
 end
 
 StandardKmerIterator{K}(s::BioSequence) where K = StandardKmerIterator{K, typeof(s)}(s)
+
+# Size is unknown because ambiguous nucleotides are skipped
 Base.IteratorSize(::Type{<:StandardKmerIterator{<:Any, <:BioSequence{<:NucleicAcidAlphabet{4}}}}) = Base.SizeUnknown()
-Base.length(::StandardKmerIterator{K, BioSequence{<:NucleicAcidAlphabet{2}}}) where K = length(s.seq) - ksize(K) + 1
+Base.length(s::StandardKmerIterator{K, <:BioSequence{<:NucleicAcidAlphabet{2}}}) where K = length(s.seq) - ksize(K) + 1
 Base.eltype(s::Type{<:StandardKmerIterator{K}}) where K = MerIter{K}
 
 complement_encoded(A::NucleicAcidAlphabet{2}, bits::Unsigned) = bits ⊻ typeof(bits)(3)
 complement_encoded(A::NucleicAcidAlphabet{4}, bits::Unsigned) = @inbounds FOURBIT_C_LUT[bits + 1]
 
-const TWOBIT_LUT = (0xf, 0x0, 0x1, 0x0,
+const TWOBIT_LUT = (0xf, 0x0, 0x1, 0xf,
                     0x2, 0xf, 0xf, 0xf,
                     0x3, 0xf, 0xf, 0xf,
                     0xf, 0xf, 0xf, 0xf)
@@ -358,7 +385,8 @@ convert_encoding(to::NucleicAcidAlphabet{N}, from::NucleicAcidAlphabet{N}, x) wh
 convert_encoding(to::NucleicAcidAlphabet{2}, from::NucleicAcidAlphabet{4}, x) = @inbounds TWOBIT_LUT[x + 1]
 convert_encoding(to::NucleicAcidAlphabet{4}, from::NucleicAcidAlphabet{2}, x) = 0x01 ↞ x
 
-function fill_k!(::Type{K}, seq, p) where {K <: Kmer}
+# Reads in K symbols from seq into kmers of type K, starting from pos p
+function fill_k(::Type{K}, seq, p) where {K <: Kmer}
     fw = rv = typemin(K)
     good = true
     for i in 1:ksize(K)
@@ -379,19 +407,19 @@ end
     fw = rv = typemin(K)
     while !good
         i + ksize(K) > len && return nothing
-        fw, rv, good = fill_k!(K, it.seq, i)
+        fw, rv, good = fill_k(K, it.seq, i)
         i += ksize(K)
     end
-    res = MerIter(i, fw, rv)
+    res = MerIter(i - ksize(K), fw, rv)
     return res, res
 end
 
 @inline function Base.iterate(it::StandardKmerIterator{K}, state) where K
-    i = state.pos + 1
+    len = length(it.seq)
+    i = state.pos + ksize(K)
+    i > len && return nothing
     fw = state.fw
     rv = state.rv
-    len = length(it.seq)
-    i > len && return nothing
     data = extract_data(it.seq, i)
     encoding = convert_encoding(Alphabet(K), Alphabet(it.seq), data)
     complemented = complement_encoded(Alphabet(K), encoding)
@@ -400,10 +428,10 @@ end
     good = encoding < 0xf
     while !good
         i + ksize(K) > len && return nothing
-        fw, rv, good = fill_k!(K, it.seq, i)
+        fw, rv, good = fill_k(K, it.seq, i + 1)
         i += ksize(K)
     end
-    res = MerIter(i, fw, rv)
+    res = MerIter(i - ksize(K) + 1, fw, rv)
     return res, res
 end
 
