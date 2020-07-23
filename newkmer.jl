@@ -8,16 +8,44 @@ import Random
 import BioSequences: encoded_data, extract_encoded_element, complement_bitpar,
 reversebits, BitsPerSymbol, reverse, complement, reverse_complement,
 MerIterResult, encoded_data_eltype, repeatpattern, canonical, inbounds_getindex,
-encoded_data_type, bits_per_symbol, bitmask, decode, encode, bitindex, BitIndex
+encoded_data_type, bits_per_symbol, bitmask, decode, encode, bitindex, BitIndex,
+offset, DefaultAASampler
 
 struct Kmer{K, A <: Alphabet, T <: Unsigned} <: BioSequence{A}
     data::T
 
     function Kmer{K, A, T}(data::Integer) where {K, A, T}
-        if capacity(Kmer{K, A, T}) < K
-            throw(ArgumentError("Kmer of type $T cannot support a K of $K"))
-        end
+        check_kmer_len(Kmer{K, A, T})
         return new(data)
+    end
+end
+
+# TODO: Update BioSequences/src/bit-manipulation/bitindex offset_mask(i::BitIndex)
+# to not return a UInt8 but a W type
+
+# Normally error functions should have noinline, but since this is resolved
+# at compile time, we really want to inline this to remove the check.
+@inline function check_kmer_len(::Type{T}) where {T <: Kmer}
+    capacity(T) < ksize(T) && throw(ArgumentError("Kmer of type $T is too small"))
+end
+
+# Should also be resolved at compile time
+@inline function kmertype(::Type{Kmer{K, A}}) where {K, A}
+    bits = K * bits_per_symbol(A())
+    if bits < 33
+        return Kmer{K, A, UInt32}
+    elseif bits < 65
+        return Kmer{K, A, UInt64}
+    elseif bits < 129
+        return Kmer{K, A, UInt128}
+    elseif bits < 257
+        return Kmer{K, A, UInt256}
+    elseif bits < 513
+        return Kmer{K, A, UInt512}
+    elseif bits < 1025
+        return Kmer{K, A, UInt1024}
+    else
+        throw(InexactError(:kmertype, Kmer, Kmer{K, A}))
     end
 end
 
@@ -33,13 +61,17 @@ end
 encoded_data(m::Kmer) = m.data
 Base.length(m::Kmer{K}) where K = K
 mask(::Type{<:Kmer{K, A, T}}) where {K, A, T} = one(T) << (bits_per_symbol(A()) * K) - 1
-capacity(::Type{<:Kmer{K, A, T}}) where {K, A, T} = div(8, bits_per_symbol(A())) * sizeof(T)
+capacity(::Type{<:Kmer{K, A, T}}) where {K, A, T} = div(8 * sizeof(T), bits_per_symbol(A()))
 ksize(::Type{<:Kmer{K}}) where K = K
 Base.summary(x::Kmer{K, A}) where {K, A} = string(K, "-mer of ", A)
 encoded_data_type(::Type{<:Kmer{K, A, T}}) where {K, A, T} = T
-Base.zero(::Type{T}) where {T <: Kmer} = T(zero(encoded_data_type(T)))
+Base.typemin(::Type{T}) where {T <: Kmer} = T(zero(encoded_data_type(T)))
 
 # TODO: Add this to Twiddle?
+# The reason we have these functions is that the normal Julia bitshifts take
+# negative shifts and large shifts into account, and so emit more complicated
+# code than necessary for our purposes. These functions compile to one single
+# CPU instruction.
 ↞(data::Unsigned, shift::Integer) = data << (shift & (8*sizeof(data) - 1))
 ↠(data::Unsigned, shift::Integer) = data >>> (shift & (8*sizeof(data) - 1))
 
@@ -51,7 +83,7 @@ Base.zero(::Type{T}) where {T <: Kmer} = T(zero(encoded_data_type(T)))
 end
 
 function extract_encoded_element(bitind::BitIndex, data::Unsigned)
-    return (data ↠ bitind.val) & bitmask(bits_per_symbol(bitind))
+    return (data ↠ offset(bitind)) & bitmask(bits_per_symbol(bitind))
 end
 
 # TODO: Fix the one in BioSequences instead or lift it here.
@@ -68,6 +100,18 @@ end
 end
 
 reversebits(x::Unsigned, ::BitsPerSymbol{8}) = bswap(x)
+
+# This function is less efficient than the above ones, and is used as a
+# generic fallback and for B over 8
+function reversebits(x::Unsigned, ::BitsPerSymbol{B}) where B
+    y = zero(typeof(x))
+    for i in 1:div(8*sizeof(x), B)
+        y <<= B
+        y |= x & (bitmask(B) % typeof(x))
+        x >>>= B
+    end
+    return y
+end
 
 @inline function complement(m::Kmer{K, <:NucleicAcidAlphabet}) where K
     typeof(m)(complement_bitpar(m.data, Alphabet(m)) & mask(typeof(m)))
@@ -87,13 +131,15 @@ function canonical(m::Kmer)
     return ifelse(m < rv, m, rv)
 end
 
-# Add symbol to end, pushing position in kmer
+# Add symbol to end, shifting the kmers one position leftwards
 @inline function push(m::Kmer, symbol_)
     symbol = convert(eltype(typeof(m)), symbol_)
     encoding = encode(Alphabet(m), symbol)
     return push(m, encoding)
 end
 
+# Same as above, but taking the already-encoded data. More efficient when you
+# can save decoding/re-encoding.
 @inline function push(m::Kmer, encoded::Unsigned)
     data = m.data ↞ bits_per_symbol(m)
     data |= encoded
@@ -106,6 +152,8 @@ end
     return or_bits(shifted, x, 1)
 end
 
+# Sets the i'th position of m to symbol_, but uses bitwise or, so it only
+# works if those bits are unset beforehand.
 @inline function or_bits(m::Kmer, symbol_, i::Integer)
     symbol = convert(eltype(typeof(m)), symbol_)
     encoding = encode(Alphabet(m), symbol)
@@ -113,7 +161,7 @@ end
 end
 
 @inline function or_bits(m::Kmer, encoding::Unsigned, i::Integer)
-    add = (encoding % encoded_data_type(m)) ↞ bitindex(m, i).val
+    add = (encoding % encoded_data_type(m)) ↞ offset(bitindex(m, i))
     return typeof(m)(m.data | add)
 end
 
@@ -128,7 +176,7 @@ end
 
 function Kmer{K, A, T}(s) where {K, A, T}
     kT = Kmer{K, A, T}
-    m = zero(kT)
+    m = typemin(kT)
     k = 0
     for i in s
         k += 1
@@ -136,6 +184,19 @@ function Kmer{K, A, T}(s) where {K, A, T}
         m = or_bits(m, i, k)
     end
     k == K || throw(ArgumentError("Input sequence not length K"))
+    return m
+end
+
+# This is awfully type unstable.
+function Kmer{A}(s) where {A}
+    K = length(s)
+    kT = kmertype(Kmer{K, A})
+    m = typemin(kT)
+    k = 0
+    for i in s
+        k += 1
+        m = or_bits(m, i, k)
+    end
     return m
 end
 
@@ -153,9 +214,35 @@ function repeatpattern(::Type{T}, pattern::P) where {T <: Unsigned, P <: Unsigne
     return y[] * pattern
 end
 
-# TODO: This only works for up to 8 bits per symbol
+function Base.rand(::Type{T}) where {T <: Kmer}
+    return T(rand(encoded_data_type(T)) & mask(T))
+end
+
+# Special case so that only nonambiguous bases are created.
+function Base.rand(::Type{T}) where {T <: Kmer{K, <:NucleicAcidAlphabet{4}} where K}
+    mask = rand(encoded_data_type(T))
+    nuc = repeatpattern(encoded_data_type(T), 0x11)
+    nuc = 0x1111111111111111
+    nuc = ((nuc & mask) << 1) | (nuc & ~mask)
+    mask >>>= 1
+    nuc = ((nuc & mask) << 2) | (nuc & ~mask)
+    return T(nuc)
+end
+
+# Special case with uniform distribution of 20 canonical AAs
+function Base.rand(::Type{T}) where {T <: Kmer{K, AminoAcidAlphabet} where K}
+    m = typemin(T)
+    for i in eachindex(m)
+        encoding = reinterpret(UInt8, rand(DefaultAASampler))
+        m = or_bits(m, encoding, i)
+    end
+    return m
+end
+
+Random.shuffle(m::Kmer) = _shuffle(m, BitsPerSymbol(m))
+
 # It allocates, but in-register shuffles are very slow for larger kmers
-function Random.shuffle(m::Kmer)
+function _shuffle(m::Kmer, ::Union{BitsPerSymbol{2}, BitsPerSymbol{4}, BitsPerSymbol{8}})
     # Convert to vector
     v = Vector{UInt8}(undef, length(m))
     data = m.data
@@ -171,7 +258,7 @@ function Random.shuffle(m::Kmer)
     end
 
     # Convert back to kmer
-    result = zero(typeof(m))
+    result = typemin(typeof(m))
     @inbounds for i in eachindex(m)
         result = or_bits(result, v[i], i)
     end
@@ -213,7 +300,7 @@ Base.eltype(s::Type{<:SimpleKmerIterator{K}}) where K = K
 
 function Base.iterate(it::SimpleKmerIterator{K}) where K
     length(it) < 1 && return nothing
-    m = zero(K)
+    m = typemin(K)
     for i in eachindex(m)
         data = extract_data(it.seq, i)
         m = or_bits(m, data, i)
@@ -243,11 +330,7 @@ struct StandardKmerIterator{K <: Kmer{<:Any, <:NucleicAcidAlphabet}, S <: BioSeq
     seq::S
 
     function StandardKmerIterator{K, S}(s::S) where {K<:Kmer{<:Any, A} where A, S}
-        if capacity(K) < ksize(K)
-            T = encoded_data_type(K)
-            k = ksize(K)
-            throw(ArgumentError("Kmer of type $T cannot support a K of $k"))
-        end
+        check_kmer_len(K)
         new(s)
     end
 end
@@ -265,8 +348,6 @@ const TWOBIT_LUT = (0xf, 0x0, 0x1, 0x0,
                     0x3, 0xf, 0xf, 0xf,
                     0xf, 0xf, 0xf, 0xf)
 
-const FOURBIT_LUT = (0x1, 0x2, 0x4, 0x8)
-
 const FOURBIT_C_LUT = (0x00, 0x08, 0x04, 0x0c,
                        0x02, 0x0a, 0x06, 0x0e,
                        0x01, 0x09, 0x05, 0x0d,
@@ -275,11 +356,10 @@ const FOURBIT_C_LUT = (0x00, 0x08, 0x04, 0x0c,
 # Fallback
 convert_encoding(to::NucleicAcidAlphabet{N}, from::NucleicAcidAlphabet{N}, x) where N = x
 convert_encoding(to::NucleicAcidAlphabet{2}, from::NucleicAcidAlphabet{4}, x) = @inbounds TWOBIT_LUT[x + 1]
-convert_encoding(to::NucleicAcidAlphabet{4}, from::NucleicAcidAlphabet{2}, x) = @inbounds FOURBIT_LUT[x + 1]
+convert_encoding(to::NucleicAcidAlphabet{4}, from::NucleicAcidAlphabet{2}, x) = 0x01 ↞ x
 
 function fill_k!(::Type{K}, seq, p) where {K <: Kmer}
-    fw = zero(K)
-    rv = zero(K)
+    fw = rv = typemin(K)
     good = true
     for i in 1:ksize(K)
         data = extract_data(seq, p+i-1)
@@ -296,7 +376,7 @@ end
     good = false
     len = length(it.seq)
     i = 1
-    fw = rv = zero(K)
+    fw = rv = typemin(K)
     while !good
         i + ksize(K) > len && return nothing
         fw, rv, good = fill_k!(K, it.seq, i)
