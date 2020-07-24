@@ -9,7 +9,9 @@ import BioSequences: encoded_data, extract_encoded_element, complement_bitpar,
 reversebits, BitsPerSymbol, reverse, complement, reverse_complement,
 MerIterResult, encoded_data_eltype, repeatpattern, canonical, inbounds_getindex,
 encoded_data_type, bits_per_symbol, bitmask, decode, encode, bitindex, BitIndex,
-offset, DefaultAASampler, remove_newlines
+offset, DefaultAASampler, remove_newlines, symbols_per_data_element
+
+include("seqview.jl")
 
 struct Kmer{A <: Alphabet, K, T <: Unsigned} <: BioSequence{A}
     data::T
@@ -31,7 +33,8 @@ end
 # Normally error functions should have noinline, but since this is resolved
 # at compile time, we really want to inline this to remove the check.
 @inline function check_kmer_len(::Type{T}) where {T <: Kmer}
-    capacity(T) < ksize(T) && throw(ArgumentError("Kmer of type $T is too small"))
+    c = capacity(T)
+    c < ksize(T) && throw(ArgumentError("Kmer of type $T can only encode $c symbols"))
 end
 
 # Should also be resolved at compile time
@@ -299,11 +302,11 @@ end
 ###########################
 
 # Generic fallback for biosequence type
-@inline extract_data(s::BioSequence, i::Integer) = unsafe_getindex(s, i)
+@inline extract_data(s::BioSequence, i::Integer) = inbounds_getindex(s, i)
 
-# This is more efficient since we can load data directly from one encoding to
-# the other with no re-encoding/decoding
-@inline function extract_data(s::Union{Kmer, LongSequence}, i::Integer)
+# These sequence types share encoding scheme, so we can skip the
+# decoding/re-encoding scheme
+@inline function extract_data(s::Union{Kmer, LongSequence, SeqView}, i::Integer)
     extract_encoded_element(bitindex(s, i), encoded_data(s))
 end
 
@@ -435,5 +438,7 @@ end
     res = MerIter(i - ksize(K) + 1, fw, rv)
     return res, res
 end
+
+#################
 
 end # t
