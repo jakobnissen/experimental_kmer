@@ -11,11 +11,11 @@ MerIterResult, encoded_data_eltype, repeatpattern, canonical, inbounds_getindex,
 encoded_data_type, bits_per_symbol, bitmask, decode, encode, bitindex, BitIndex,
 offset, DefaultAASampler, remove_newlines
 
-struct Kmer{K, A <: Alphabet, T <: Unsigned} <: BioSequence{A}
+struct Kmer{A <: Alphabet, K, T <: Unsigned} <: BioSequence{A}
     data::T
 
-    function Kmer{K, A, T}(data::Integer) where {K, A, T}
-        check_kmer_len(Kmer{K, A, T})
+    function Kmer{A, K, T}(data::Integer) where {A, K, T}
+        check_kmer_len(Kmer{A, K, T})
         return new(data)
     end
 end
@@ -35,47 +35,47 @@ end
 end
 
 # Should also be resolved at compile time
-@inline function kmertype(::Type{Kmer{K, A}}) where {K, A}
+@inline function kmertype(::Type{Kmer{A, K}}) where {A, K}
     bits = K * bits_per_symbol(A())
     # Default to 64 bits, because they can fit in most registers.
     if bits < 65
-        return Kmer{K, A, UInt64}
+        return Kmer{A, K, UInt64}
     elseif bits < 129
-        return Kmer{K, A, UInt128}
+        return Kmer{A, K, UInt128}
     elseif bits < 257
-        return Kmer{K, A, UInt256}
+        return Kmer{A, K, UInt256}
     elseif bits < 513
-        return Kmer{K, A, UInt512}
+        return Kmer{A, K, UInt512}
     elseif bits < 1025
-        return Kmer{K, A, UInt1024}
+        return Kmer{A, K, UInt1024}
     else
-        throw(InexactError(:kmertype, Kmer, Kmer{K, A}))
+        throw(InexactError(:kmertype, Kmer, Kmer{A, K}))
     end
 end
 
-const RNAKmer{K} = Kmer{K, RNAAlphabet{2}, UInt64}
-const DNAKmer{K} = Kmer{K, DNAAlphabet{2}, UInt64}
-const AAKmer{K} = Kmer{K, AminoAcidAlphabet, UInt64}
+const RNAKmer{K} = Kmer{RNAAlphabet{2}, K, UInt64}
+const DNAKmer{K} = Kmer{DNAAlphabet{2}, K, UInt64}
+const AAKmer{K} = Kmer{AminoAcidAlphabet, K, UInt64}
 
 # Convert between different storage data types. This is still safe because
 # check_kmer_len will take care of catching truncated bits, and at compile time.
-function Base.convert(::Type{<:Kmer{K, A, T1}}, m::Kmer{K, A, T2}) where {K, A, T1, T2}
-    return Kmer{K, A, T1}(m.data % T1)
+function Base.convert(::Type{<:Kmer{A, K, T1}}, m::Kmer{A, K, T2}) where {A, K, T1, T2}
+    return Kmer{A, K, T1}(m.data % T1)
 end
 
 # Convert from NucleicAcidAlphabet{N} to each other
-function Base.convert(::Type{kT}, m::Kmer{K, <:NucleicAcidAlphabet{N}, T2}) where
-         {K, N, T2, kT <: Kmer{K, <:NucleicAcidAlphabet{N}, T1}} where T1
+function Base.convert(::Type{kT}, m::Kmer{<:NucleicAcidAlphabet{N}, K, T2}) where
+         {K, N, T2, kT <: Kmer{<:NucleicAcidAlphabet{N}, K, T1}} where T1
     return kT(m.data % T1)
 end
 
 encoded_data(m::Kmer) = m.data
-Base.length(m::Kmer{K}) where K = K
-mask(::Type{<:Kmer{K, A, T}}) where {K, A, T} = one(T) << (bits_per_symbol(A()) * K) - 1
-capacity(::Type{<:Kmer{K, A, T}}) where {K, A, T} = div(8 * sizeof(T), bits_per_symbol(A()))
-ksize(::Type{<:Kmer{K}}) where K = K
-Base.summary(x::Kmer{K, A}) where {K, A} = string(K, "-mer of ", A)
-encoded_data_type(::Type{<:Kmer{K, A, T}}) where {K, A, T} = T
+Base.length(m::Kmer) = ksize(typeof(m))
+mask(::Type{<:Kmer{A, K, T}}) where {A, K, T} = one(T) << (bits_per_symbol(A()) * K) - 1
+capacity(::Type{<:Kmer{A, K, T}}) where {A, K, T} = div(8 * sizeof(T), bits_per_symbol(A()))
+ksize(::Type{<:Kmer{A, K}}) where {A, K} = K
+Base.summary(x::Kmer{A, K}) where {A, K} = string(K, "-mer of ", A)
+encoded_data_type(::Type{<:Kmer{A, K, T}}) where {A, K, T} = T
 Base.typemin(::Type{T}) where {T <: Kmer} = T(zero(encoded_data_type(T)))
 
 # TODO: Add this to Twiddle?
@@ -125,11 +125,11 @@ function reversebits(x::Unsigned, ::BitsPerSymbol{B}) where B
     return y
 end
 
-@inline function complement(m::Kmer{K, <:NucleicAcidAlphabet}) where K
+@inline function complement(m::Kmer{<:NucleicAcidAlphabet})
     typeof(m)(complement_bitpar(m.data, Alphabet(m)) & mask(typeof(m)))
 end
 
-@inline function reverse(m::Kmer{K, A}) where {K, A}
+@inline function reverse(m::Kmer{A, K}) where {A, K}
     T = typeof(m)
     data = reversebits(m.data, BitsPerSymbol(m))
     offset = bits_per_symbol(A()) * (capacity(T) - ksize(T))
@@ -186,8 +186,8 @@ function Base.hash(x::Mer{<:NucleicAcidAlphabet{2},K}, h::UInt) where {K}
     return Base.hash_uint64(encoded_data(x) ⊻ K ⊻ h)
 end
 
-function Kmer{K, A, T}(s) where {K, A, T}
-    kT = Kmer{K, A, T}
+function Kmer{A, K, T}(s) where {A, K, T}
+    kT = Kmer{A, K, T}
     m = typemin(kT)
     k = 0
     for i in s
@@ -199,29 +199,26 @@ function Kmer{K, A, T}(s) where {K, A, T}
     return m
 end
 
-# function (::Type{Foo{A,B,C} where {A,C}})() where {B}
-#     ...
-# end
+# This is for use in e.g. DNAKmer("TAG")
+function (::Type{Kmer{A, K, T} where K})(s) where {A, T}
+    K = length(s)
+    return Kmer{A, K, T}(s)
+end
 
+# For use in macros (mostly)
 function Kmer(::A, s) where {A <: Alphabet}
     K = length(s)
-    kT = kmertype(Kmer{K, A})
-    m = typemin(kT)
-    k = 0
-    for i in s
-        k += 1
-        m = or_bits(m, i, k)
-    end
-    return m
+    kT = kmertype(Kmer{A, K})
+    return kT(s)
 end
 
 macro kmer_str(seq, flag)
     if flag == "dna" || flag == "d"
-        A = DNAAlphabet{2}
+        A = DNAAlphabet{2}()
     elseif flag == "rna" || flag == "r"
-        A = RNAAlphabet{2}
+        A = RNAAlphabet{2}()
     elseif flag == "aa" || flag == "a"
-        A = AminoAcidAlphabet
+        A = AminoAcidAlphabet()
     else
         error("Invalid type flag: '$(flag)'")
     end
@@ -229,7 +226,7 @@ macro kmer_str(seq, flag)
 end
 
 macro kmer_str(seq)
-    return Kmer(DNAAlphabet{2}, remove_newlines(seq))
+    return Kmer(DNAAlphabet{2}(), remove_newlines(seq))
 end
 
 # TODO: Add this to Twiddle?
@@ -251,7 +248,7 @@ function Base.rand(::Type{T}) where {T <: Kmer}
 end
 
 # Special case so that only nonambiguous bases are created.
-function Base.rand(::Type{T}) where {T <: Kmer{K, <:NucleicAcidAlphabet{4}} where K}
+function Base.rand(::Type{T}) where {T <: Kmer{<:NucleicAcidAlphabet{4}}}
     mask = rand(encoded_data_type(T))
     nuc = repeatpattern(encoded_data_type(T), 0x11)
     nuc = ((nuc & mask) << 1) | (nuc & ~mask)
@@ -261,7 +258,7 @@ function Base.rand(::Type{T}) where {T <: Kmer{K, <:NucleicAcidAlphabet{4}} wher
 end
 
 # Special case with uniform distribution of 20 canonical AAs
-function Base.rand(::Type{T}) where {T <: Kmer{K, AminoAcidAlphabet} where K}
+function Base.rand(::Type{T}) where {T <: Kmer{AminoAcidAlphabet, K} where K}
     m = typemin(T)
     for i in eachindex(m)
         encoding = reinterpret(UInt8, rand(DefaultAASampler))
@@ -313,7 +310,7 @@ end
 struct SimpleKmerIterator{K <: Kmer, S <: BioSequence}
     seq::S
 
-    function SimpleKmerIterator{K, S}(s::S) where {K<:Kmer{<:Any, A} where A, S}
+    function SimpleKmerIterator{K, S}(s::S) where {K<:Kmer{A} where A, S}
         if Alphabet(K) !== Alphabet(S)
             throw(ArgumentError("Parameters K and S must have same alphabets"))
         end
@@ -355,10 +352,10 @@ end
 
 canonical(m::MerIter) = ifelse(m.fw < m.rv, m.fw, m.rv)
 
-struct StandardKmerIterator{K <: Kmer{<:Any, <:NucleicAcidAlphabet}, S <: BioSequence{<:NucleicAcidAlphabet}}
+struct StandardKmerIterator{K <: Kmer{<:NucleicAcidAlphabet}, S <: BioSequence{<:NucleicAcidAlphabet}}
     seq::S
 
-    function StandardKmerIterator{K, S}(s::S) where {K<:Kmer{<:Any, A} where A, S}
+    function StandardKmerIterator{K, S}(s::S) where {K<:Kmer{A} where A, S}
         check_kmer_len(K)
         new(s)
     end
