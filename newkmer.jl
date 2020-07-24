@@ -57,11 +57,17 @@ const RNAKmer{K} = Kmer{K, RNAAlphabet{2}, UInt64}
 const DNAKmer{K} = Kmer{K, DNAAlphabet{2}, UInt64}
 const AAKmer{K} = Kmer{K, AminoAcidAlphabet, UInt64}
 
+# Convert between different storage data types. This is still safe because
+# check_kmer_len will take care of catching truncated bits, and at compile time.
 function Base.convert(::Type{<:Kmer{K, A, T1}}, m::Kmer{K, A, T2}) where {K, A, T1, T2}
     return Kmer{K, A, T1}(m.data % T1)
 end
 
-# TODO: Add convertsion methods from NucleicAcidAlphabet to each other
+# Convert from NucleicAcidAlphabet{N} to each other
+function Base.convert(::Type{kT}, m::Kmer{K, <:NucleicAcidAlphabet{N}, T2}) where
+         {K, N, T2, kT <: Kmer{K, <:NucleicAcidAlphabet{N}, T1}} where T1
+    return kT(m.data % T1)
+end
 
 encoded_data(m::Kmer) = m.data
 Base.length(m::Kmer{K}) where K = K
@@ -197,8 +203,7 @@ end
 #     ...
 # end
 
-# TODO: Make a proper constructor for this, I just can't figure out how
-function Kmer(::Type{A}, s) where {A <: Alphabet}
+function Kmer(::A, s) where {A <: Alphabet}
     K = length(s)
     kT = kmertype(Kmer{K, A})
     m = typemin(kT)
@@ -249,7 +254,6 @@ end
 function Base.rand(::Type{T}) where {T <: Kmer{K, <:NucleicAcidAlphabet{4}} where K}
     mask = rand(encoded_data_type(T))
     nuc = repeatpattern(encoded_data_type(T), 0x11)
-    nuc = 0x1111111111111111
     nuc = ((nuc & mask) << 1) | (nuc & ~mask)
     mask >>>= 1
     nuc = ((nuc & mask) << 2) | (nuc & ~mask)
@@ -298,7 +302,7 @@ end
 ###########################
 
 # Generic fallback for biosequence type
-@inline extract_data(s::BioSequence, i::Integer) = @inbounds s[i]
+@inline extract_data(s::BioSequence, i::Integer) = unsafe_getindex(s, i)
 
 # This is more efficient since we can load data directly from one encoding to
 # the other with no re-encoding/decoding
