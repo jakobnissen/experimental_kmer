@@ -1,4 +1,5 @@
 # Experimental kmers
+__Update: This work here is made obsolete by Ben Ward's superior [NTupleKmers](https://github.com/BioJulia/NTupleKmers.jl), which as of 2020-09-25 is planned to become the default kmer type in BioJulia__
 
 This is a proof-of-concept package. It is intended show a working example of a more general, very "hackable", yet still fast, kmer type for use in BioSequences.
 
